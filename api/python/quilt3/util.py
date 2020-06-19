@@ -341,7 +341,9 @@ def get_package_registry(path=None):
     """ Returns the package registry root for a given path """
     if path is None:
         path = get_from_config('default_local_registry')
-    return path.rstrip('/') + '/.quilt'
+    if path.rstrip("/").endswith(".quilt/v2"):
+        return path.rstrip("/")
+    return path.rstrip('/') + '/.quilt/v2'
 
 
 def configure_from_url(catalog_url):

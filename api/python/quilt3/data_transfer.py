@@ -10,6 +10,7 @@ import shutil
 from threading import Lock
 from typing import List
 import warnings
+from datetime import datetime
 
 from botocore import UNSIGNED
 from botocore.client import Config
@@ -24,6 +25,7 @@ from tqdm import tqdm
 
 from .session import create_botocore_session
 from .util import PhysicalKey, QuiltException, DISABLE_TQDM
+from .dotquilt_layout import DotQuiltLayout
 
 MAX_COPY_FILE_LIST_RETRIES = 3
 MAX_FIX_HASH_RETRIES = 3
@@ -60,6 +62,9 @@ class S3ClientProvider:
     access public s3 buckets.
 
     We assume that public buckets are read-only: write operations should always use S3ClientProvider.standard_client
+
+    TODO: This is a crappy hack done at the last minute. Better idea is to have class mimic the s3 client and try both
+          normal and unsigned clients, caching which worked for a bucket so we try that one first.
     """
 
     def __init__(self):
@@ -665,6 +670,85 @@ def list_url(src: PhysicalKey):
                 if not key.startswith(src_path):
                     raise ValueError("Unexpected key: %r" % key)
                 yield key[len(src_path):], obj['Size']
+
+
+def list_url_with_datetime(src: PhysicalKey):
+    # Returns created time for local items and last modified time for s3 items
+    if src.is_local():
+        src_file = pathlib.Path(src.path)
+
+        for f in src_file.rglob('*'):
+            try:
+                if f.is_file():
+                    size = f.stat().st_size
+                    created_datetime = datetime.fromtimestamp(f.stat().st_ctime)
+                    yield f.relative_to(src_file).as_posix(), size, created_datetime
+            except FileNotFoundError:
+                # If a file does not exist, is it really a file?
+                pass
+    else:
+        if src.version_id is not None:
+            raise ValueError(f"Directories cannot have version IDs: {src}")
+        src_path = src.path
+        if not _looks_like_dir(src):
+            src_path += '/'
+        list_obj_params = dict(Bucket=src.bucket, Prefix=src_path)
+        s3_client = S3ClientProvider().find_correct_client(S3Api.LIST_OBJECTS_V2, src.bucket, list_obj_params)
+        paginator = s3_client.get_paginator('list_objects_v2')
+        for response in paginator.paginate(**list_obj_params):
+            for obj in response.get('Contents', []):
+                key = obj['Key']
+                if not key.startswith(src_path):
+                    raise ValueError("Unexpected key: %r" % key)
+                yield key[len(src_path):], obj['Size'], obj["LastModified"]
+
+
+def new_latest_manifest_tophash(registry: PhysicalKey, package_name: str, tophash_to_ignore=None) -> str:
+    """
+    List the manifests and return the tophash of the most recent one. For local fs, recent means created time according
+    to the OS. For s3, recent means last modified time (which for immutable packages is the same as created time).
+
+    tophash_to_ignore exists to help with eventual consistency when deleting a packafe version
+
+    If there are no other package versions, returns None
+    """
+    assert isinstance(registry, PhysicalKey)
+
+    manifest_dir_pk = DotQuiltLayout.package_manifest_dir(registry, package_name)
+    files = []
+    if manifest_dir_pk.is_local():
+        src_file = pathlib.Path(manifest_dir_pk.path)
+
+        for f in src_file.rglob('*'):
+            try:
+                if f.is_file():
+                    created_ts_ns = f.stat().st_ctime_ns
+                    rel_path = f.relative_to(src_file).as_posix()
+                    tophash = DotQuiltLayout.extract_tophash(rel_path)
+                    if tophash_to_ignore is not None and tophash == tophash_to_ignore:
+                        continue
+                    files.append((rel_path, created_ts_ns))
+            except FileNotFoundError:
+                # If a file does not exist, is it really a file?
+                pass
+    else:
+        src_path = manifest_dir_pk.path
+        list_obj_params = dict(Bucket=manifest_dir_pk.bucket, Prefix=src_path)
+        s3_client = S3ClientProvider().find_correct_client(
+            S3Api.LIST_OBJECTS_V2, manifest_dir_pk.bucket, list_obj_params)
+        paginator = s3_client.get_paginator('list_objects_v2')
+        for response in paginator.paginate(**list_obj_params):
+            for obj in response.get('Contents', []):
+                key = obj['Key']
+                tophash = DotQuiltLayout.extract_tophash(key)
+                if tophash_to_ignore is not None and tophash == tophash_to_ignore:
+                    continue
+                files.append((tophash, obj["LastModified"].timestamp()))
+
+    if len(files) == 0:
+        return None
+    most_recent_tophash, _ = max(files, key=lambda item: item[1])
+    return most_recent_tophash
 
 
 def delete_url(src: PhysicalKey):
